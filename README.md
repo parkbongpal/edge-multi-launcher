@@ -1,5 +1,3 @@
-<img width="508" height="816" alt="image" src="https://github.com/user-attachments/assets/06ba9866-57be-4459-8d5b-dde5c04a2473" /><br>
-
 
 <기능><br>
 1. 드래그로 선택, 선택된 브라우저 실행 및 4X2로 배치하기<br>
@@ -9,6 +7,10 @@
 5. 종료시 열린창 일괄종료<br>
 6. 일괄 사이트 접속(현재탭에서 열기/새탭에서 열기)<br>
 7. 새탭 열기,최근탭 닫기, 새로고침<br>
+
+<img width="508" height="816" alt="image" src="https://github.com/user-attachments/assets/06ba9866-57be-4459-8d5b-dde5c04a2473" /><br>
+
+
 
 EXE 파일을 누르고 View raw를 누르면 exe파일만 다운로드됩니다.<br>
 <br>
