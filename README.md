@@ -7,3 +7,7 @@ pyinstaller --noconsole --onefile --distpath . --name "EdgeMultiLauncher" main.p
 ```
 <br>
 이렇게 하면 자잘한 파일들 안남고 EXE파일만 남음.
+
+<br>
+저는 모니터 2개를 상하로 쓰며 FHD모니터를 사용하고있으므로
+원본코드를 ai에게 자신의 모니터 상황에 맞게 바꿔달라고 하면됩니다.
