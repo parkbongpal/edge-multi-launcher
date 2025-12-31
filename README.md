@@ -4,5 +4,6 @@ EXE 파일을 누르고 View raw를 누르면 exe파일만 다운로드됩니다
 마지막 명령어만<br>
 ```bash
 pyinstaller --noconsole --onefile --distpath . --name "EdgeMultiLauncher" main.py && rd /s /q build && del EdgeMultiLauncher.spec
+```
 <br>
 이렇게 하면 자잘한 파일들 안남고 EXE파일만 남음.
