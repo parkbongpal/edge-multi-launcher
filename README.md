@@ -9,6 +9,7 @@
 6. 일괄 사이트 접속(현재탭에서 열기/새탭에서 열기)<br>
 7. 새탭 열기,최근탭 닫기, 새로고침<br>
 8. 텍스트 전송, 제어창 컴팩트,최적화<br>
+9. F2로 단일 클릭 일괄전송
 
 <img width="443" height="704" alt="image" src="https://github.com/user-attachments/assets/81e4c858-afd8-4c93-bd9f-2a9ecbbb7c21" />
 
