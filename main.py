@@ -4,13 +4,16 @@ import subprocess
 import psutil
 import json
 import os
+import signal  # [추가] Ctrl+C 처리를 위한 모듈
 from pathlib import Path
+import threading
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, 
                              QPushButton, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QLineEdit, QMessageBox, QFrame)
+                             QLineEdit, QMessageBox, QFrame, QTextEdit, QToolTip,
+                             QMenu, QWidgetAction) # [추가] 팝업 메뉴 관련 클래스
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
-from PyQt6.QtGui import QCursor, QFont, QColor
+from PyQt6.QtGui import QCursor, QFont, QColor, QAction
 
 import win32gui
 import win32con
@@ -22,30 +25,31 @@ import win32clipboard
 # 테마 및 레이아웃 설정 상수
 # ==========================================
 class Theme:
-    PRIMARY = "#4F46E5"    # 실행 중 (Blue)
+    PRIMARY = "#4F46E5"
     SURFACE = "#F8FAFC"
     CARD_BG = "#FFFFFF"
     BORDER = "#E2E8F0"
     TEXT_MAIN = "#1E293B"
     TEXT_SUB = "#64748B"
-    SUCCESS = "#10B981"    # 선택됨 (Green)
-    DANGER = "#EF4444"     # 종료 중 (Red)
-    ACCENT = "#F59E0B"     # 기타 강조 (Orange)
-    ACTIVE = "#8B5CF6"     # 실제로 눈에 보이는 창 (Purple)
+    SUCCESS = "#10B981"
+    DANGER = "#EF4444"
+    ACCENT = "#F59E0B"
+    ACTIVE = "#8B5CF6"
+    SPECIAL = "#EC4899"
 
-# [수정 포인트] 이 수치들을 조절하면 레이아웃이 자동으로 변합니다.
-BTN_SIZE = 45           # 버튼 가로세로 크기
-H_SPACING = 2           # 버튼 사이 좌우 간격 (원하시는 숫자로 변경하세요)
-V_SPACING = 5           # 버튼 사이 상하 간격
-WINDOW_LR_MARGIN = 12   # 윈도우 좌우 여백
+BTN_SIZE = 38
+H_SPACING = 2
+V_SPACING = 5
+WINDOW_LR_MARGIN = 12
 
 class Styles:
     MAIN_WINDOW = f"background-color: {Theme.SURFACE};"
     CARD = f"QFrame {{ background-color: {Theme.CARD_BG}; border: 1px solid {Theme.BORDER}; border-radius: 12px; }}"
     LABEL_TITLE = f"color: {Theme.TEXT_MAIN}; font-size: 18px; font-weight: bold; border: none;"
     LABEL_SUB = f"color: {Theme.TEXT_SUB}; font-size: 13px; font-weight: 600; border: none;"
-    INPUT = f"QLineEdit {{ border: 1px solid {Theme.BORDER}; border-radius: 8px; padding: 0 12px; background: {Theme.SURFACE}; font-size: 13px; color: {Theme.TEXT_MAIN}; }} QLineEdit:focus {{ border: 2px solid {Theme.PRIMARY}; background: white; }}"
-    BTN_SYNC = f"QPushButton {{ background: {Theme.SURFACE}; border: 1px solid {Theme.BORDER}; color: {Theme.PRIMARY}; font-weight: bold; border-radius: 8px; font-size: 12px; }} QPushButton:hover {{ background: #EEF2FF; border: 1px solid {Theme.PRIMARY}; }}"
+    INPUT = f"QLineEdit, QTextEdit {{ border: 1px solid {Theme.BORDER}; border-radius: 8px; padding: 8px 12px; background: {Theme.SURFACE}; font-size: 13px; color: {Theme.TEXT_MAIN}; }} QLineEdit:focus, QTextEdit:focus {{ border: 2px solid {Theme.PRIMARY}; background: white; }}"
+    BTN_CMD = f"QPushButton {{ background: {Theme.SURFACE}; border: 1px solid {Theme.BORDER}; color: {Theme.TEXT_MAIN}; font-weight: bold; border-radius: 6px; font-size: 11px; }} QPushButton:hover {{ background: #EEF2FF; border: 1px solid {Theme.PRIMARY}; color: {Theme.PRIMARY}; }}"
+    BTN_SPECIAL = f"QPushButton {{ background: {Theme.SPECIAL}; color: white; font-weight: bold; border-radius: 6px; border: none; font-size: 11px; }} QPushButton:hover {{ opacity: 0.9; }}"
 
 # ==========================================
 # 비즈니스 로직 및 유틸리티
@@ -94,6 +98,33 @@ class WindowUtils:
         except: return False
 
     @staticmethod
+    def is_window_focused(hwnd):
+        try: return win32gui.GetForegroundWindow() == hwnd
+        except: return False
+
+    @staticmethod
+    def ensure_modifiers_released():
+        modifiers = [win32con.VK_MENU, win32con.VK_CONTROL, win32con.VK_SHIFT, win32con.VK_LWIN, win32con.VK_RWIN]
+        for key in modifiers:
+            win32api.keybd_event(key, 0, win32con.KEYEVENTF_KEYUP, 0)
+        time.sleep(0.05)
+
+    @staticmethod
+    def verify_modifiers_released(timeout=0.5):
+        modifiers = [win32con.VK_MENU, win32con.VK_CONTROL, win32con.VK_SHIFT]
+        start = time.time()
+        while time.time() - start < timeout:
+            all_released = True
+            for key in modifiers:
+                if win32api.GetAsyncKeyState(key) & 0x8000:
+                    all_released = False
+                    win32api.keybd_event(key, 0, win32con.KEYEVENTF_KEYUP, 0)
+            if all_released:
+                return True
+            time.sleep(0.02)
+        return True
+
+    @staticmethod
     def bring_to_front(hwnd, focus=True):
         try:
             if win32gui.IsIconic(hwnd): win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
@@ -102,9 +133,11 @@ class WindowUtils:
                 win32gui.SetForegroundWindow(hwnd)
                 win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
                 win32gui.ShowWindow(hwnd, win32con.SW_SHOW)
+                WindowUtils.ensure_modifiers_released()
+                WindowUtils.verify_modifiers_released()
+                time.sleep(0.1)
             else:
-                win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0, 
-                                      win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
+                win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 0, 0, 0, 0, win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE)
             return True
         except: return False
 
@@ -134,6 +167,55 @@ class WindowUtils:
             return True
         win32gui.EnumWindows(cb, None)
         return hwnds
+
+    @staticmethod
+    def wait_for_focus(hwnd, timeout=3.0, check_interval=0.05):
+        start = time.time()
+        while time.time() - start < timeout:
+            if WindowUtils.is_window_focused(hwnd):
+                time.sleep(0.15)
+                return True
+            time.sleep(check_interval)
+        return False
+
+    @staticmethod
+    def click_at_position(hwnd, x, y):
+        try:
+            lParam = win32api.MAKELONG(int(x), int(y))
+            win32gui.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
+            time.sleep(0.02)
+            win32gui.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, lParam)
+            return True
+        except: return False
+
+# ==========================================
+# 전역 핫키 모니터링
+# ==========================================
+class GlobalHotkeyMonitor:
+    def __init__(self, callback):
+        self.callback = callback
+        self.running = False
+        self.thread = None
+        self.last_f2_state = False
+    
+    def start(self):
+        if self.running: return
+        self.running = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+    
+    def stop(self):
+        self.running = False
+    
+    def _monitor_loop(self):
+        while self.running:
+            try:
+                current_state = win32api.GetAsyncKeyState(win32con.VK_F2) & 0x8000
+                if current_state and not self.last_f2_state:
+                    self.callback()
+                self.last_f2_state = current_state
+            except: pass
+            time.sleep(0.05)
 
 # ==========================================
 # 조작용 쓰레드
@@ -221,6 +303,48 @@ class SyncThread(QThread):
         self.profile_windows = profile_windows
         self.kwargs = kwargs
 
+    def send_key_safely(self, hwnd, vk_key):
+        for attempt in range(3):
+            if WindowUtils.wait_for_focus(hwnd, timeout=2.5):
+                try:
+                    time.sleep(0.2)
+                    win32api.keybd_event(vk_key, 0, 0, 0)
+                    time.sleep(0.1)
+                    win32api.keybd_event(vk_key, 0, win32con.KEYEVENTF_KEYUP, 0)
+                    time.sleep(0.2)
+                    return True
+                except: pass
+            time.sleep(0.3)
+        return False
+
+    def send_text_safely(self, hwnd, text, send_enter=False):
+        if not WindowUtils.wait_for_focus(hwnd, timeout=2.0):
+            return False
+        try:
+            for _ in range(3):
+                try:
+                    win32clipboard.OpenClipboard()
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(text)
+                    win32clipboard.CloseClipboard()
+                    break
+                except: time.sleep(0.1)
+            
+            time.sleep(0.15)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+            win32api.keybd_event(0x56, 0, 0, 0)
+            time.sleep(0.05)
+            win32api.keybd_event(0x56, 0, win32con.KEYEVENTF_KEYUP, 0)
+            win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+            
+            if send_enter:
+                time.sleep(0.15)
+                win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
+                time.sleep(0.05)
+                win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
+            return True
+        except: return False
+
     def run(self):
         sorted_items = sorted(self.profile_windows.items())
         active_pids_hwnds = [(pid, hwnd) for pid, hwnd in sorted_items if WindowUtils.is_window_valid(hwnd)]
@@ -239,9 +363,29 @@ class SyncThread(QThread):
                     break
                 except: time.sleep(0.1)
 
+        if self.action_type == 'text':
+            text = self.kwargs.get('text', '').strip()
+            if not text:
+                self.finished_signal.emit()
+                return
+            for _ in range(3):
+                try:
+                    win32clipboard.OpenClipboard()
+                    win32clipboard.EmptyClipboard()
+                    win32clipboard.SetClipboardText(text)
+                    win32clipboard.CloseClipboard()
+                    break
+                except: time.sleep(0.1)
+
         for idx, (pid, hwnd) in enumerate(active_pids_hwnds, 1):
-            if not WindowUtils.bring_to_front(hwnd, focus=True): continue 
-            time.sleep(0.5 if idx == 1 else 0.2)
+            if not WindowUtils.bring_to_front(hwnd, focus=True): 
+                continue
+            
+            if self.action_type == 'f12':
+                time.sleep(0.8 if idx == 1 else 0.6)
+            else:
+                time.sleep(0.5 if idx == 1 else 0.3)
+            
             if self.action_type == 'url':
                 try:
                     if self.kwargs.get('new_tab', False):
@@ -251,25 +395,46 @@ class SyncThread(QThread):
                         win32api.keybd_event(0x54, 0, win32con.KEYEVENTF_KEYUP, 0)
                         win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
                         time.sleep(0.3)
+                    
                     win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
                     win32api.keybd_event(0x4C, 0, 0, 0)
                     time.sleep(0.05)
                     win32api.keybd_event(0x4C, 0, win32con.KEYEVENTF_KEYUP, 0)
                     win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
-                    time.sleep(0.2) 
+                    time.sleep(0.2)
+                    
                     win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
                     win32api.keybd_event(0x56, 0, 0, 0)
                     time.sleep(0.05)
                     win32api.keybd_event(0x56, 0, win32con.KEYEVENTF_KEYUP, 0)
                     win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
                     time.sleep(0.15)
+                    
                     win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
                     time.sleep(0.05)
                     win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
-                    self.log_signal.emit(f"📍 전송 ({idx}/{len(active_pids_hwnds)})")
+                    self.log_signal.emit(f"📍 URL 전송 ({idx}/{len(active_pids_hwnds)})")
                 except: pass
+                
+            elif self.action_type == 'text':
+                WindowUtils.ensure_modifiers_released()
+                time.sleep(0.1)
+                
+                send_enter = self.kwargs.get('send_enter', False)
+                if self.send_text_safely(hwnd, text, send_enter):
+                    suffix = "+Enter" if send_enter else ""
+                    self.log_signal.emit(f"📝 텍스트 전송{suffix} ({idx}/{len(active_pids_hwnds)})")
+                else:
+                    self.log_signal.emit(f"⚠️ 텍스트 전송 실패 ({idx}/{len(active_pids_hwnds)})")
+                    
+            elif self.action_type == 'f12':
+                if self.send_key_safely(hwnd, win32con.VK_F12):
+                    self.log_signal.emit(f"🔧 F12 전송 ({idx}/{len(active_pids_hwnds)})")
+                else:
+                    self.log_signal.emit(f"⚠️ F12 전송 실패 ({idx}/{len(active_pids_hwnds)})")
+                    
             elif self.action_type == 'key':
-                km = {'ctrl+t': (win32con.VK_CONTROL, 0x54), 'ctrl+w': (win32con.VK_CONTROL, 0x57), 'f5': (None, win32con.VK_F5)}
+                km = { 'ctrl+t': (win32con.VK_CONTROL, 0x54), 'ctrl+w': (win32con.VK_CONTROL, 0x57), 'f5': (None, win32con.VK_F5) }
                 combo = self.kwargs.get('key_combo', '')
                 if combo in km:
                     mod, main = km[combo]
@@ -279,12 +444,63 @@ class SyncThread(QThread):
                     win32api.keybd_event(main, 0, win32con.KEYEVENTF_KEYUP, 0)
                     if mod: win32api.keybd_event(mod, 0, win32con.KEYEVENTF_KEYUP, 0)
                     self.log_signal.emit(f"⌨️ {combo} ({idx}/{len(active_pids_hwnds)})")
-            time.sleep(0.1)
+                    
+            elif self.action_type == 'click':
+                rel_x, rel_y = self.kwargs.get('rel_x', 0), self.kwargs.get('rel_y', 0)
+                try:
+                    if WindowUtils.click_at_position(hwnd, int(rel_x), int(rel_y)):
+                        self.log_signal.emit(f"🖱️ 클릭 ({idx}/{len(active_pids_hwnds)})")
+                    else:
+                        self.log_signal.emit(f"⚠️ 클릭 실패 ({idx}/{len(active_pids_hwnds)})")
+                except: pass
+            
+            time.sleep(0.15)
         self.finished_signal.emit()
 
 # ==========================================
 # UI 컴포넌트
 # ==========================================
+class HelpButton(QPushButton):
+    """[수정] 마우스 오버 시 툴팁 즉시 표시, 클릭 시 팝업 고정 (사라짐 방지)"""
+    def __init__(self, text, color, parent=None):
+        super().__init__(text, parent)
+        self.setFixedSize(80, 28)
+        self.setStyleSheet(f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; border-radius: 8px; border: none; font-size: 11px; }} QPushButton:hover {{ opacity: 0.9; }}")
+
+    def enterEvent(self, event):
+        # 마우스 오버: 즉시 툴팁 표시 (미리보기)
+        QToolTip.showText(QCursor.pos(), self.toolTip(), self)
+        super().enterEvent(event)
+
+    def mousePressEvent(self, event):
+        # 클릭: 팝업 메뉴로 고정 (클릭해야 사라짐)
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 툴팁 내용을 담을 라벨 생성
+            lbl = QLabel(self.toolTip())
+            lbl.setStyleSheet(f"""
+                QLabel {{
+                    background-color: {Theme.SURFACE}; 
+                    color: {Theme.TEXT_MAIN}; 
+                    border: 1px solid {Theme.PRIMARY}; 
+                    border-radius: 6px; 
+                    padding: 8px;
+                }}
+            """)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            
+            # 메뉴 생성 (프레임 없는 팝업처럼 보이게 설정)
+            menu = QMenu(self)
+            menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
+            menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            
+            # 라벨을 메뉴 액션으로 추가
+            act = QWidgetAction(menu)
+            act.setDefaultWidget(lbl)
+            menu.addAction(act)
+            
+            # 마우스 위치에 실행 (블로킹 동작) - 다른 곳 클릭 시 닫힘
+            menu.exec(QCursor.pos())
+
 class GridButton(QPushButton):
     def __init__(self, text, profile_id, parent_window):
         super().__init__(text)
@@ -293,14 +509,23 @@ class GridButton(QPushButton):
         self.setCheckable(True)
         self.setFixedSize(BTN_SIZE, BTN_SIZE)
         self.is_closing = False
-        self.is_active = False 
+        self.is_active = False
+        self.last_state = None 
         self.update_style()
 
     def update_style(self):
-        base = "font-size: 14px; font-weight: bold; border-radius: 8px;"
+        is_managed = self.profile_id in self.parent_window.profile_windows
+        current_state = (self.is_closing, self.is_active, is_managed, self.isChecked())
+        
+        if self.last_state == current_state:
+            return 
+        
+        self.last_state = current_state
+
+        base = "font-size: 13px; font-weight: bold; border-radius: 8px;"
         if self.is_closing: style = f"background-color: {Theme.DANGER}; color: white; border: none;"
         elif self.is_active: style = f"background-color: {Theme.ACTIVE}; color: white; border: 2px solid white;"
-        elif self.profile_id in self.parent_window.profile_windows: style = f"background-color: {Theme.PRIMARY}; color: white; border: none;"
+        elif is_managed: style = f"background-color: {Theme.PRIMARY}; color: white; border: none;"
         elif self.isChecked(): style = f"background-color: {Theme.SUCCESS}; color: white; border: none;"
         else: style = f"background-color: white; border: 1px solid {Theme.BORDER}; color: {Theme.TEXT_MAIN};"
         self.setStyleSheet(f"QPushButton {{ {base} {style} }} QPushButton:hover {{ opacity: 0.8; }}")
@@ -349,20 +574,33 @@ class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Edge Multi-Launcher PRO")
-        self.buttons = {}; self.profile_windows = {}; self.is_dragging = False; self.is_right_dragging = False; self.last_hovered_id = None 
+        self.buttons = {}; self.profile_windows = {}
+        self.is_dragging = False; self.is_right_dragging = False; self.last_hovered_id = None
+        self.click_capture_mode = False
+        self.click_capture_source_hwnd = None
         
-        # [수정] 윈도우 너비 자동 계산 공식 적용
+        self.hotkey_monitor = GlobalHotkeyMonitor(self.on_f2_pressed)
+        self.hotkey_monitor.start()
+        
         calc_width = (BTN_SIZE * 10) + (H_SPACING * 9) + 20 + (WINDOW_LR_MARGIN * 2) + 4
         
         saved = AppDataConfig.load_window_position()
         if saved: 
             self.setGeometry(saved[0], saved[1], calc_width, saved[3])
         else: 
-            self.setGeometry(100, 100, calc_width, 850)
+            self.setGeometry(100, 100, calc_width, 640)
         
         self.setFixedWidth(calc_width) 
         self.init_ui()
-        self.check_timer = QTimer(); self.check_timer.timeout.connect(self.check_windows_status); self.check_timer.start(400) 
+        self.check_timer = QTimer()
+        self.check_timer.timeout.connect(self.check_windows_status)
+        self.check_timer.start(200)
+
+    def on_f2_pressed(self):
+        if not self.click_capture_mode:
+            self.click_capture_mode = True
+            self.click_capture_source_hwnd = None
+            self.status.setText("🎯 F2 활성 - 관리 중인 브라우저를 클릭하세요 (ESC: 취소)")
 
     def set_always_on_top(self, on):
         hwnd = int(self.winId()); flag = win32con.HWND_TOPMOST if on else win32con.HWND_NOTOPMOST
@@ -370,21 +608,46 @@ class LauncherWindow(QMainWindow):
 
     def init_ui(self):
         self.setStyleSheet(Styles.MAIN_WINDOW); central = QWidget(); self.setCentralWidget(central)
-        layout = QVBoxLayout(central); layout.setSpacing(8)
+        layout = QVBoxLayout(central); layout.setSpacing(6)
         layout.setContentsMargins(WINDOW_LR_MARGIN, 8, WINDOW_LR_MARGIN, 12)
         
+        header_layout = QHBoxLayout()
+        
+        # [수정] 커스텀 버튼 사용
+        btn_help = HelpButton("💡 사용법", Theme.TEXT_SUB)
+        
+        help_text = """
+        <p style='font-weight:bold; font-size:12px;'>[상태 색상]</p>
+        <p>⬜ 미실행 &nbsp; 🟩 선택</p>
+        <p>🟦 실행 &nbsp; &nbsp; 🟪 활성</p>
+        <p>🟥 종료중</p>
+        <hr>
+        <p style='font-weight:bold; font-size:12px;'>[조작 방법]</p>
+        <p>🖱️ <b>좌클릭/드래그:</b> 선택 및 활성화</p>
+        <p>🖱️ <b>우클릭/드래그:</b> 해당 창 종료</p>
+        <p>⌨️ <b>F2:</b> 클릭 좌표 동기화 모드</p>
+        """
+        btn_help.setToolTip(help_text)
+
         header = QLabel("🚀 Edge Multi-Launcher PRO"); header.setStyleSheet(Styles.LABEL_TITLE)
-        layout.addWidget(header, alignment=Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self._create_batch_card())
+        
+        header_layout.addStretch()  
+        header_layout.addWidget(header) 
+        header_layout.addStretch()  
+        header_layout.addWidget(btn_help) 
+        
+        layout.addLayout(header_layout)
+        
+        layout.addWidget(self._create_control_card())
         
         grid_card = QFrame(); grid_card.setStyleSheet(Styles.CARD)
         grid_lay = QVBoxLayout(grid_card)
-        grid_lay.setContentsMargins(10, 10, 10, 10) 
+        grid_lay.setContentsMargins(10, 10, 10, 10)
         
         grid_widget = QWidget()
         grid = QGridLayout(grid_widget)
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(H_SPACING) 
+        grid.setHorizontalSpacing(H_SPACING)
         grid.setVerticalSpacing(V_SPACING)
         
         for i in range(1, 101):
@@ -393,66 +656,74 @@ class LauncherWindow(QMainWindow):
             grid.addWidget(btn, (i-1)//10, (i-1)%10)
         
         grid_lay.addWidget(grid_widget); layout.addWidget(grid_card)
-        layout.addWidget(self._create_legend_card()) # 범례 및 가이드 복구
         
         btn_lay = QHBoxLayout()
+
         self.btn_launch = self._create_btn("실행 및 배치", Theme.SUCCESS, self.run_batch); btn_lay.addWidget(self.btn_launch)
         btn_lay.addWidget(self._create_btn("선택 해제", Theme.TEXT_SUB, self.clear_selection))
         btn_lay.addWidget(self._create_btn("전체 활성화", Theme.PRIMARY, self.activate_all_browsers))
         btn_lay.addWidget(self._create_btn("전체 최소화", Theme.ACCENT, self.minimize_all_browsers))
         btn_lay.addWidget(self._create_btn("전체 종료", Theme.DANGER, self.close_all_managed)); layout.addLayout(btn_lay)
+        
         self.status = QLabel("Ready"); self.status.setAlignment(Qt.AlignmentFlag.AlignCenter); self.status.setStyleSheet(Styles.LABEL_SUB); layout.addWidget(self.status)
+        
+        layout.addStretch(1) 
 
-    def _create_batch_card(self):
-        card = QFrame(); card.setStyleSheet(Styles.CARD); v_lay = QVBoxLayout(card); v_lay.setContentsMargins(10, 6, 10, 6); v_lay.setSpacing(5)
-        title = QLabel("⚡ 일괄 조작"); title.setStyleSheet(f"color: {Theme.PRIMARY}; font-weight: bold; border:none;"); v_lay.addWidget(title)
-        h_lay = QHBoxLayout(); h_lay.setSpacing(5)
-        self.url_input = QLineEdit(); self.url_input.setFixedHeight(36); self.url_input.setPlaceholderText("URL 입력...")
-        self.url_input.setStyleSheet(Styles.INPUT); self.url_input.returnPressed.connect(lambda: self.send_url_to_all(False)); h_lay.addWidget(self.url_input, stretch=1)
-        for lbl, func in [("현재", lambda: self.send_url_to_all(False)), ("새탭", lambda: self.send_url_to_all(True))]:
-            b = QPushButton(lbl); b.setFixedSize(45, 36); b.setStyleSheet(f"background-color: {Theme.PRIMARY if lbl=='새탭' else Theme.ACCENT}; color: white; font-weight: bold; border-radius: 8px; border: none; font-size: 11px;"); b.clicked.connect(func); h_lay.addWidget(b)
-        for lbl, key in [("탭열기", "ctrl+t"), ("탭닫기", "ctrl+w"), ("🔃F5", "f5")]:
-            b = QPushButton(lbl); b.setFixedSize(45, 36); b.setStyleSheet(Styles.BTN_SYNC); b.clicked.connect(lambda ch, k=key: self.send_shortcut(k)); h_lay.addWidget(b)
-        v_lay.addLayout(h_lay); return card
+    def _create_control_card(self):
+        card = QFrame()
+        card.setStyleSheet(Styles.CARD)
+        
+        h_main_lay = QHBoxLayout(card)
+        h_main_lay.setContentsMargins(10, 8, 10, 8)
+        h_main_lay.setSpacing(10)
 
-    def _create_legend_card(self):
-            card = QFrame()
-            card.setStyleSheet(Styles.CARD)
-            lay = QHBoxLayout(card)
-            lay.setContentsMargins(12, 8, 12, 8)
+        left_box = QVBoxLayout()
+        left_box.setSpacing(4)
+        
+        title = QLabel("🎮 통합 제어")
+        title.setStyleSheet(f"color: {Theme.PRIMARY}; font-weight: bold; border:none; font-size: 12px;")
+        left_box.addWidget(title)
+
+        self.unified_input = QTextEdit()
+        self.unified_input.setFixedHeight(70) 
+        self.unified_input.setPlaceholderText("URL/텍스트 입력\n(줄바꿈 가능)")
+        self.unified_input.setStyleSheet(Styles.INPUT)
+        left_box.addWidget(self.unified_input)
+        
+        h_main_lay.addLayout(left_box, stretch=4) 
+
+        btns = [
+            ("🌐 URL(현재)", lambda: self.send_url_to_all(False), Theme.PRIMARY),
+            ("✨ URL(새탭)", lambda: self.send_url_to_all(True), Theme.ACCENT),
+            ("📑 새탭", lambda: self.send_shortcut("ctrl+t"), Theme.SURFACE),
+            ("✖️ 탭닫기", lambda: self.send_shortcut("ctrl+w"), Theme.SURFACE),
             
-            # 색상 범례 리스트 (기존 유지)
-            colors = [("⬜", "미실행"), ("🟩", "선택"), ("🟦", "실행"), ("🟪", "활성"), ("🟥", "종료중")]
-            color_section = QHBoxLayout()
-            color_section.setSpacing(8)
-            for icon, txt in colors:
-                l = QLabel(f"{icon} {txt}")
-                l.setStyleSheet("font-size: 12px; font-weight: 600; border: none; color: #475569;")
-                color_section.addWidget(l)
-            
-            # [수정] HTML 줄바꿈(<br/>)과 폰트 스타일 적용
-            guide = QLabel(
-                '<div style="line-height: 140%;">'
-                '<span style="color: black;">🖱️ 좌클릭/드래그: 선택,활성화</span><br/>'
-                '<span style="color: red;">🖱️ 우클릭/드래그: 종료</span>'
-                '</div>'
-            )
-            # 가독성 좋은 '맑은 고딕' 적용 및 우측 정렬
-            guide.setStyleSheet("""
-                font-family: 'Malgun Gothic', 'Segoe UI', sans-serif;
-                font-size: 12px; 
-                font-weight: bold; 
-                border: none;
-            """)
-            guide.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            
-            lay.addLayout(color_section)
-            lay.addStretch()
-            lay.addWidget(guide)
-            return card
+            ("📝 텍스트", lambda: self.send_text_to_all(False), Theme.SPECIAL),
+            ("↵ 엔터포함", lambda: self.send_text_to_all(True), Theme.SUCCESS),
+            ("🔃 F5", lambda: self.send_shortcut("f5"), Theme.SURFACE),
+            ("🔧 F12", self.send_f12, Theme.SURFACE),
+        ]
+
+        right_grid = QGridLayout()
+        right_grid.setSpacing(4)
+        right_grid.setContentsMargins(0, 0, 0, 0)
+
+        for i, (text, func, color) in enumerate(btns):
+            b = QPushButton(text)
+            b.setMinimumHeight(32)
+            if color == Theme.SURFACE:
+                b.setStyleSheet(Styles.BTN_CMD)
+            else:
+                b.setStyleSheet(f"QPushButton {{ background: {color}; color: white; border: none; font-weight: bold; border-radius: 6px; font-size: 11px; }} QPushButton:hover {{ opacity: 0.9; }}")
+            b.clicked.connect(func)
+            right_grid.addWidget(b, i // 4, i % 4)
+
+        h_main_lay.addLayout(right_grid, stretch=6) 
+        
+        return card
 
     def _create_btn(self, text, color, func):
-        btn = QPushButton(text); btn.setFixedHeight(40); btn.clicked.connect(func); btn.setStyleSheet(f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; border-radius: 8px; border: none; font-size: 11px; }} QPushButton:hover {{ opacity: 0.9; }}"); return btn
+        btn = QPushButton(text); btn.setFixedHeight(35); btn.clicked.connect(func); btn.setStyleSheet(f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; border-radius: 8px; border: none; font-size: 11px; }} QPushButton:hover {{ opacity: 0.9; }}"); return btn
 
     def activate_all_browsers(self):
         for h in [h for h in self.profile_windows.values() if WindowUtils.is_window_valid(h)]: WindowUtils.bring_to_front(h, focus=True); time.sleep(0.05)
@@ -463,34 +734,88 @@ class LauncherWindow(QMainWindow):
             except: pass
 
     def send_url_to_all(self, new_tab=False):
-        url = self.url_input.text().strip(); 
+        url = self.unified_input.toPlainText().strip()
         if not url: return
-        self.sync_thread = SyncThread('url', self.profile_windows, url=url, new_tab=new_tab); self.sync_thread.log_signal.connect(self.status.setText); self.sync_thread.start()
+        self.sync_thread = SyncThread('url', self.profile_windows, url=url, new_tab=new_tab)
+        self.sync_thread.log_signal.connect(self.status.setText)
+        self.sync_thread.start()
+
+    def send_text_to_all(self, with_enter=False):
+        text = self.unified_input.toPlainText().strip()
+        if not text: 
+            self.status.setText("⚠️ 전송할 텍스트가 없습니다")
+            return
+        self.sync_thread = SyncThread('text', self.profile_windows, text=text, send_enter=with_enter)
+        self.sync_thread.log_signal.connect(self.status.setText)
+        self.sync_thread.start()
+
+    def send_f12(self):
+        self.sync_thread = SyncThread('f12', self.profile_windows)
+        self.sync_thread.log_signal.connect(self.status.setText)
+        self.sync_thread.start()
 
     def send_shortcut(self, key):
-        self.sync_thread = SyncThread('key', self.profile_windows, key_combo=key); self.sync_thread.log_signal.connect(self.status.setText); self.sync_thread.start()
+        self.sync_thread = SyncThread('key', self.profile_windows, key_combo=key)
+        self.sync_thread.log_signal.connect(self.status.setText)
+        self.sync_thread.start()
 
     def check_windows_status(self):
-        fg_hwnd = win32gui.GetForegroundWindow()
-        for pid, hwnd in list(self.profile_windows.items()):
-            if not WindowUtils.is_window_valid(hwnd):
-                del self.profile_windows[pid]; 
-                if pid in self.buttons: self.buttons[pid].is_active = False; self.buttons[pid].show_close_animation()
-            else:
-                if pid in self.buttons:
-                    if hwnd == fg_hwnd: self.buttons[pid].is_active = True; continue
-                    if win32gui.IsIconic(hwnd): self.buttons[pid].is_active = False
-                    else:
-                        try:
-                            rect = win32gui.GetWindowRect(hwnd); points = [((rect[0]+rect[2])//2, (rect[1]+rect[3])//2), (rect[0]+15, rect[1]+15)]
-                            visible = False
-                            for pt in points:
-                                at_pt = win32gui.WindowFromPoint(pt)
-                                if at_pt and win32gui.GetAncestor(at_pt, win32con.GA_ROOT) == hwnd: visible = True; break
-                            self.buttons[pid].is_active = visible
-                        except: self.buttons[pid].is_active = False
-        for btn in self.buttons.values():
-            if not btn.is_closing: btn.update_style()
+        try:
+            if self.click_capture_mode and not self.click_capture_source_hwnd:
+                if win32api.GetAsyncKeyState(win32con.VK_ESCAPE) & 0x8000:
+                    self.click_capture_mode = False
+                    self.status.setText("🚫 동기화 취소됨 (ESC)")
+                    return
+
+                try:
+                    if win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000:
+                        time.sleep(0.05)
+                        cursor_pos = win32api.GetCursorPos()
+                        clicked_hwnd = win32gui.WindowFromPoint(cursor_pos)
+                        root_hwnd = win32gui.GetAncestor(clicked_hwnd, win32con.GA_ROOT)
+                        
+                        if root_hwnd in self.profile_windows.values():
+                            self.click_capture_source_hwnd = root_hwnd
+                            client_pt = win32gui.ScreenToClient(root_hwnd, cursor_pos)
+                            
+                            self.status.setText(f"✅ 좌표 캡처: ({client_pt[0]}, {client_pt[1]}) - 전송 중...")
+                            
+                            self.sync_thread = SyncThread('click', self.profile_windows, 
+                                                        rel_x=client_pt[0], rel_y=client_pt[1])
+                            self.sync_thread.log_signal.connect(self.status.setText)
+                            self.sync_thread.start()
+                            
+                            self.click_capture_mode = False
+                            time.sleep(0.2)
+                        else:
+                            self.click_capture_mode = False
+                            self.status.setText("🚫 동기화 취소됨 (외부 클릭)")
+                            time.sleep(0.2)
+                except: pass
+            
+            fg_hwnd = win32gui.GetForegroundWindow()
+            for pid, hwnd in list(self.profile_windows.items()):
+                if not WindowUtils.is_window_valid(hwnd):
+                    del self.profile_windows[pid]
+                    if pid in self.buttons: self.buttons[pid].is_active = False; self.buttons[pid].show_close_animation()
+                else:
+                    if pid in self.buttons:
+                        if hwnd == fg_hwnd: self.buttons[pid].is_active = True; continue
+                        if win32gui.IsIconic(hwnd): self.buttons[pid].is_active = False
+                        else:
+                            try:
+                                rect = win32gui.GetWindowRect(hwnd); points = [((rect[0]+rect[2])//2, (rect[1]+rect[3])//2), (rect[0]+15, rect[1]+15)]
+                                visible = False
+                                for pt in points:
+                                    at_pt = win32gui.WindowFromPoint(pt)
+                                    if at_pt and win32gui.GetAncestor(at_pt, win32con.GA_ROOT) == hwnd: visible = True; break
+                                self.buttons[pid].is_active = visible
+                            except: self.buttons[pid].is_active = False
+            for btn in self.buttons.values():
+                if not btn.is_closing: btn.update_style()
+        except KeyboardInterrupt:
+            # [추가] 타이머 내부에서 인터럽트 발생 시 무시하고 종료 흐름 따름
+            pass
 
     def clear_selection(self):
         for btn in self.buttons.values(): btn.setChecked(False); btn.update_style()
@@ -518,18 +843,24 @@ class LauncherWindow(QMainWindow):
     def save_pos(self): g = self.geometry(); AppDataConfig.save_window_position(g.x(), g.y(), g.width(), g.height())
 
     def closeEvent(self, e):
+        self.check_timer.stop()
+        self.hotkey_monitor.stop()
         pids = list(self.profile_windows.keys())
         if pids:
             rep = QMessageBox.question(self, "종료 확인", f"런처 종료 시 관리 중인 {len(pids)}개의 브라우저도 모두 종료하시겠습니까?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if rep == QMessageBox.StandardButton.Yes:
                 for p in pids: self.close_profile(p)
                 self.save_pos(); e.accept()
-            else: e.ignore()
+            else: 
+                self.check_timer.start(200)
+                e.ignore()
         else: self.save_pos(); e.accept()
 
     def moveEvent(self, e): super().moveEvent(e); self.save_pos()
     def resizeEvent(self, e): super().resizeEvent(e); self.save_pos()
 
 if __name__ == "__main__":
+    # [추가] Ctrl+C (SIGINT) 발생 시 즉시 종료하도록 설정 (타이머 오류 방지)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv); app.setStyle("Fusion")
     window = LauncherWindow(); window.show(); sys.exit(app.exec())
