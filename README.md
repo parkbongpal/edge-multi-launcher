@@ -8,8 +8,10 @@
 5. 종료시 열린창 일괄종료<br>
 6. 일괄 사이트 접속(현재탭에서 열기/새탭에서 열기)<br>
 7. 새탭 열기,최근탭 닫기, 새로고침<br>
+8. 텍스트 전송, 제어창 컴팩트,최적화<br>
 
-<img width="508" height="816" alt="image" src="https://github.com/user-attachments/assets/06ba9866-57be-4459-8d5b-dde5c04a2473" /><br>
+<img width="443" height="704" alt="image" src="https://github.com/user-attachments/assets/81e4c858-afd8-4c93-bd9f-2a9ecbbb7c21" />
+
 
 
 
