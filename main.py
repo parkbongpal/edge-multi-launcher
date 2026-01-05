@@ -4,14 +4,15 @@ import subprocess
 import psutil
 import json
 import os
-import signal  # [추가] Ctrl+C 처리를 위한 모듈
+import signal
+import re  # [추가] 프로필 ID 추출을 위한 정규표현식
 from pathlib import Path
 import threading
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, 
                              QPushButton, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QMessageBox, QFrame, QTextEdit, QToolTip,
-                             QMenu, QWidgetAction) # [추가] 팝업 메뉴 관련 클래스
+                             QMenu, QWidgetAction)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtGui import QCursor, QFont, QColor, QAction
 
@@ -127,8 +128,10 @@ class WindowUtils:
     @staticmethod
     def bring_to_front(hwnd, focus=True):
         try:
+            if not win32gui.IsWindow(hwnd): return False
             if win32gui.IsIconic(hwnd): win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
             if focus:
+                if win32gui.GetForegroundWindow() == hwnd: return True
                 win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
                 win32gui.SetForegroundWindow(hwnd)
                 win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
@@ -167,6 +170,20 @@ class WindowUtils:
             return True
         win32gui.EnumWindows(cb, None)
         return hwnds
+
+    @staticmethod
+    def get_profile_id_from_hwnd(hwnd):
+        """[추가/수정] HWND를 통해 해당 프로세스의 프로필 ID를 커맨드라인에서 추출"""
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            proc = psutil.Process(pid)
+            cmdline = proc.cmdline()
+            for arg in cmdline:
+                if "--profile-directory=" in arg:
+                    match = re.search(r"Profile (\d+)", arg)
+                    if match: return int(match.group(1))
+        except: pass
+        return None
 
     @staticmethod
     def wait_for_focus(hwnd, timeout=3.0, check_interval=0.05):
@@ -218,7 +235,7 @@ class GlobalHotkeyMonitor:
             time.sleep(0.05)
 
 # ==========================================
-# 조작용 쓰레드
+# 조작용 쓰레드 (개선된 매칭 로직 적용)
 # ==========================================
 class LauncherThread(QThread):
     log_signal = pyqtSignal(str)
@@ -228,7 +245,7 @@ class LauncherThread(QThread):
     def __init__(self, selected_ids, existing_profile_windows):
         super().__init__()
         self.selected_ids = sorted(selected_ids)
-        self.existing_profile_windows = existing_profile_windows
+        self.existing_profile_windows = existing_profile_windows.copy() # 원본 보호를 위해 카피
 
     def get_target_pos(self, i, m1, m2):
         rem = i % 10
@@ -249,11 +266,13 @@ class LauncherThread(QThread):
             return m1['x'] + (col * m1_gap), m1['y'] + (row * m1_h), m1_w, m1_h
 
     def run(self):
+        """[수정] 프로필별 순차 실행 및 정밀 HWND 매칭 로직"""
         m1, m2 = WindowUtils.get_monitors()
         if not m2: m2 = m1
-        initial_hwnds = WindowUtils.get_all_edge_hwnds()
+        
         ids_to_launch = []
 
+        # 1. 기존 실행 중인 창 우선 재배치
         for i in self.selected_ids:
             if i in self.existing_profile_windows and WindowUtils.is_window_valid(self.existing_profile_windows[i]):
                 tx, ty, tw, th = self.get_target_pos(i, m1, m2)
@@ -266,31 +285,44 @@ class LauncherThread(QThread):
             self.finished_signal.emit()
             return
 
-        self.log_signal.emit(f"🚀 {len(ids_to_launch)}개 일괄 실행...")
-        for i in ids_to_launch:
-            subprocess.Popen([EDGE_PATH, f"--profile-directory=Profile {i}", "--new-window", "--no-first-run", "--no-default-browser-check"])
+        # 2. 미실행 프로필 순차 실행 및 매칭
+        self.log_signal.emit(f"🚀 {len(ids_to_launch)}개 프로필 정밀 매칭 시작...")
         
-        matched_count = 0
-        total_to_match = len(ids_to_launch)
-        start_poll_time = time.time()
-        captured_hwnds = set()
-        
-        while matched_count < total_to_match and (time.time() - start_poll_time < 40):
-            time.sleep(0.3)
-            current_all = WindowUtils.get_all_edge_hwnds()
-            new_hwnds = list(current_all - initial_hwnds - captured_hwnds)
+        for p_id in ids_to_launch:
+            pre_hwnds = WindowUtils.get_all_edge_hwnds()
+            self.log_signal.emit(f"⏳ Profile {p_id} 실행 시도 중...")
             
-            for hwnd in new_hwnds:
-                if matched_count < total_to_match:
-                    target_id = ids_to_launch[matched_count]
-                    tx, ty, tw, th = self.get_target_pos(target_id, m1, m2)
-                    WindowUtils.activate_and_move(hwnd, tx, ty, tw, th)
-                    self.profile_launched_signal.emit(target_id, hwnd)
-                    captured_hwnds.add(hwnd)
-                    matched_count += 1
-                    self.log_signal.emit(f"📍 {target_id}번 감지 완료 ({matched_count}/{total_to_match})")
-        
-        self.log_signal.emit("✅ 배치 프로세스 완료")
+            subprocess.Popen([EDGE_PATH, f"--profile-directory=Profile {p_id}", "--new-window", "--no-first-run", "--no-default-browser-check"])
+            
+            found_hwnd = None
+            start_wait = time.time()
+            # 최대 12초 동안 새로 생성된 해당 프로필의 창을 찾음
+            while time.time() - start_wait < 12:
+                time.sleep(0.5)
+                current_hwnds = WindowUtils.get_all_edge_hwnds()
+                new_hwnds = current_hwnds - pre_hwnds
+                
+                if new_hwnds:
+                    for h in new_hwnds:
+                        if win32gui.IsWindowVisible(h):
+                            det_id = WindowUtils.get_profile_id_from_hwnd(h)
+                            # ID가 일치하거나, 분석에 실패(None)하더라도 신규 생성된 창이면 우선 매칭
+                            if det_id == p_id or det_id is None:
+                                found_hwnd = h
+                                break
+                    if found_hwnd: break
+            
+            if found_hwnd:
+                tx, ty, tw, th = self.get_target_pos(p_id, m1, m2)
+                WindowUtils.activate_and_move(found_hwnd, tx, ty, tw, th)
+                self.profile_launched_signal.emit(p_id, found_hwnd)
+                self.log_signal.emit(f"✅ Profile {p_id} 매칭 완료")
+                time.sleep(0.4) # 안정성을 위한 짧은 지연
+            else:
+                self.log_signal.emit(f"❌ Profile {p_id} 매칭 실패 (타임아웃)")
+
+        self.log_signal.emit("✅ 모든 프로세스 완료")
+        WindowUtils.ensure_modifiers_released()
         self.finished_signal.emit()
 
 class SyncThread(QThread):
@@ -363,7 +395,7 @@ class SyncThread(QThread):
                     break
                 except: time.sleep(0.1)
 
-        if self.action_type == 'text':
+        elif self.action_type == 'text':
             text = self.kwargs.get('text', '').strip()
             if not text:
                 self.finished_signal.emit()
@@ -455,50 +487,35 @@ class SyncThread(QThread):
                 except: pass
             
             time.sleep(0.15)
+        WindowUtils.ensure_modifiers_released()
         self.finished_signal.emit()
 
 # ==========================================
 # UI 컴포넌트
 # ==========================================
 class HelpButton(QPushButton):
-    """[수정] 마우스 오버 시 툴팁 즉시 표시, 클릭 시 팝업 고정 (사라짐 방지)"""
     def __init__(self, text, color, parent=None):
         super().__init__(text, parent)
         self.setFixedSize(80, 28)
         self.setStyleSheet(f"QPushButton {{ background-color: {color}; color: white; font-weight: bold; border-radius: 8px; border: none; font-size: 11px; }} QPushButton:hover {{ opacity: 0.9; }}")
 
     def enterEvent(self, event):
-        # 마우스 오버: 즉시 툴팁 표시 (미리보기)
         QToolTip.showText(QCursor.pos(), self.toolTip(), self)
         super().enterEvent(event)
 
     def mousePressEvent(self, event):
-        # 클릭: 팝업 메뉴로 고정 (클릭해야 사라짐)
         if event.button() == Qt.MouseButton.LeftButton:
-            # 툴팁 내용을 담을 라벨 생성
             lbl = QLabel(self.toolTip())
-            lbl.setStyleSheet(f"""
-                QLabel {{
-                    background-color: {Theme.SURFACE}; 
-                    color: {Theme.TEXT_MAIN}; 
-                    border: 1px solid {Theme.PRIMARY}; 
-                    border-radius: 6px; 
-                    padding: 8px;
-                }}
-            """)
+            lbl.setStyleSheet(f"QLabel {{ background-color: {Theme.SURFACE}; color: {Theme.TEXT_MAIN}; border: 1px solid {Theme.PRIMARY}; border-radius: 6px; padding: 8px; }}")
             lbl.setTextFormat(Qt.TextFormat.RichText)
             
-            # 메뉴 생성 (프레임 없는 팝업처럼 보이게 설정)
             menu = QMenu(self)
             menu.setWindowFlags(menu.windowFlags() | Qt.WindowType.FramelessWindowHint | Qt.WindowType.NoDropShadowWindowHint)
             menu.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
             
-            # 라벨을 메뉴 액션으로 추가
             act = QWidgetAction(menu)
             act.setDefaultWidget(lbl)
             menu.addAction(act)
-            
-            # 마우스 위치에 실행 (블로킹 동작) - 다른 곳 클릭 시 닫힘
             menu.exec(QCursor.pos())
 
 class GridButton(QPushButton):
@@ -573,7 +590,7 @@ class GridButton(QPushButton):
 class LauncherWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Edge Multi-Launcher PRO")
+        self.setWindowTitle("Edge Multi-Launcher PRO (Stable v2.2)")
         self.buttons = {}; self.profile_windows = {}
         self.is_dragging = False; self.is_right_dragging = False; self.last_hovered_id = None
         self.click_capture_mode = False
@@ -612,8 +629,6 @@ class LauncherWindow(QMainWindow):
         layout.setContentsMargins(WINDOW_LR_MARGIN, 8, WINDOW_LR_MARGIN, 12)
         
         header_layout = QHBoxLayout()
-        
-        # [수정] 커스텀 버튼 사용
         btn_help = HelpButton("💡 사용법", Theme.TEXT_SUB)
         
         help_text = """
@@ -637,7 +652,6 @@ class LauncherWindow(QMainWindow):
         header_layout.addWidget(btn_help) 
         
         layout.addLayout(header_layout)
-        
         layout.addWidget(self._create_control_card())
         
         grid_card = QFrame(); grid_card.setStyleSheet(Styles.CARD)
@@ -658,15 +672,15 @@ class LauncherWindow(QMainWindow):
         grid_lay.addWidget(grid_widget); layout.addWidget(grid_card)
         
         btn_lay = QHBoxLayout()
-
-        self.btn_launch = self._create_btn("실행 및 배치", Theme.SUCCESS, self.run_batch); btn_lay.addWidget(self.btn_launch)
+        self.btn_launch = self._create_btn("실행 및 정밀 매칭", Theme.SUCCESS, self.run_batch)
+        btn_lay.addWidget(self.btn_launch)
         btn_lay.addWidget(self._create_btn("선택 해제", Theme.TEXT_SUB, self.clear_selection))
         btn_lay.addWidget(self._create_btn("전체 활성화", Theme.PRIMARY, self.activate_all_browsers))
         btn_lay.addWidget(self._create_btn("전체 최소화", Theme.ACCENT, self.minimize_all_browsers))
-        btn_lay.addWidget(self._create_btn("전체 종료", Theme.DANGER, self.close_all_managed)); layout.addLayout(btn_lay)
+        btn_lay.addWidget(self._create_btn("전체 종료", Theme.DANGER, self.close_all_managed))
+        layout.addLayout(btn_lay)
         
         self.status = QLabel("Ready"); self.status.setAlignment(Qt.AlignmentFlag.AlignCenter); self.status.setStyleSheet(Styles.LABEL_SUB); layout.addWidget(self.status)
-        
         layout.addStretch(1) 
 
     def _create_control_card(self):
@@ -777,14 +791,10 @@ class LauncherWindow(QMainWindow):
                         if root_hwnd in self.profile_windows.values():
                             self.click_capture_source_hwnd = root_hwnd
                             client_pt = win32gui.ScreenToClient(root_hwnd, cursor_pos)
-                            
                             self.status.setText(f"✅ 좌표 캡처: ({client_pt[0]}, {client_pt[1]}) - 전송 중...")
-                            
-                            self.sync_thread = SyncThread('click', self.profile_windows, 
-                                                        rel_x=client_pt[0], rel_y=client_pt[1])
+                            self.sync_thread = SyncThread('click', self.profile_windows, rel_x=client_pt[0], rel_y=client_pt[1])
                             self.sync_thread.log_signal.connect(self.status.setText)
                             self.sync_thread.start()
-                            
                             self.click_capture_mode = False
                             time.sleep(0.2)
                         else:
@@ -804,7 +814,8 @@ class LauncherWindow(QMainWindow):
                         if win32gui.IsIconic(hwnd): self.buttons[pid].is_active = False
                         else:
                             try:
-                                rect = win32gui.GetWindowRect(hwnd); points = [((rect[0]+rect[2])//2, (rect[1]+rect[3])//2), (rect[0]+15, rect[1]+15)]
+                                rect = win32gui.GetWindowRect(hwnd)
+                                points = [((rect[0]+rect[2])//2, (rect[1]+rect[3])//2), (rect[0]+15, rect[1]+15)]
                                 visible = False
                                 for pt in points:
                                     at_pt = win32gui.WindowFromPoint(pt)
@@ -813,9 +824,7 @@ class LauncherWindow(QMainWindow):
                             except: self.buttons[pid].is_active = False
             for btn in self.buttons.values():
                 if not btn.is_closing: btn.update_style()
-        except KeyboardInterrupt:
-            # [추가] 타이머 내부에서 인터럽트 발생 시 무시하고 종료 흐름 따름
-            pass
+        except: pass
 
     def clear_selection(self):
         for btn in self.buttons.values(): btn.setChecked(False); btn.update_style()
@@ -823,9 +832,12 @@ class LauncherWindow(QMainWindow):
     def run_batch(self):
         sel = [i for i, b in self.buttons.items() if b.isChecked()]
         if not sel: self.status.setText("⚠️ 선택된 프로필 없음"); return
-        self.btn_launch.setEnabled(False); self.thread = LauncherThread(sel, self.profile_windows)
-        self.thread.log_signal.connect(self.status.setText); self.thread.profile_launched_signal.connect(lambda p, h: self.profile_windows.update({p: h}))
-        self.thread.finished_signal.connect(lambda: (self.btn_launch.setEnabled(True), self.check_windows_status())); self.thread.start()
+        self.btn_launch.setEnabled(False)
+        self.thread = LauncherThread(sel, self.profile_windows)
+        self.thread.log_signal.connect(self.status.setText)
+        self.thread.profile_launched_signal.connect(lambda p, h: self.profile_windows.update({p: h}))
+        self.thread.finished_signal.connect(lambda: (self.btn_launch.setEnabled(True), self.check_windows_status()))
+        self.thread.start()
 
     def activate_profile(self, pid, focus=True):
         if pid in self.profile_windows: WindowUtils.bring_to_front(self.profile_windows[pid], focus=focus)
@@ -860,7 +872,6 @@ class LauncherWindow(QMainWindow):
     def resizeEvent(self, e): super().resizeEvent(e); self.save_pos()
 
 if __name__ == "__main__":
-    # [추가] Ctrl+C (SIGINT) 발생 시 즉시 종료하도록 설정 (타이머 오류 방지)
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     app = QApplication(sys.argv); app.setStyle("Fusion")
     window = LauncherWindow(); window.show(); sys.exit(app.exec())
